@@ -1,0 +1,22 @@
+[package]
+name = "japs2me"
+version = "0.1.0"
+edition = "2021"
+description = "Just A PS2 Memory Card Editor - A CLI for managing PCSX2 memory card images"
+license = "GPL-3.0-or-later"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+flate2 = "1"
+anyhow = "1"
+crc32fast = "1"
+time = { version = "0.3", features = ["formatting", "parsing", "macros"] }
+tempfile = "3"
+
+[[bin]]
+name = "japs2me"
+path = "src/main.rs"
+
+[lib]
+name = "japs2me"
+path = "src/lib.rs"
