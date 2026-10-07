@@ -3,6 +3,7 @@ use super::ecc::page_spare;
 use super::fat::{ALLOCATED, CHAIN_END, CHAIN_END_UNALLOC};
 use super::icon_sys::parse_title;
 use super::superblock::Superblock;
+use crate::save::{SaveFile, SaveImport};
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
@@ -396,14 +397,7 @@ impl MemoryCard {
                     .checked_add(u64::from(file.length))
                     .ok_or_else(|| anyhow!("save size overflow"))?;
             }
-            let game_title = files
-                .iter()
-                .find(|file| file.name.eq_ignore_ascii_case("icon.sys"))
-                .filter(|icon| icon.length == 964)
-                .and_then(|icon| self.read_file(icon).ok())
-                .as_deref()
-                .and_then(parse_title)
-                .unwrap_or_else(|| save.name.clone());
+            let game_title = self.icon_title(&children, &save.name);
             summaries.push(SaveSummary {
                 directory: save.name.clone(),
                 game_title,
@@ -412,6 +406,65 @@ impl MemoryCard {
             });
         }
         Ok(summaries)
+    }
+
+    fn icon_title(&mut self, children: &[DirEntry], fallback: &str) -> String {
+        children
+            .iter()
+            .filter(|entry| entry.is_file())
+            .find(|file| file.name.eq_ignore_ascii_case("icon.sys"))
+            .filter(|icon| icon.length == 964)
+            .and_then(|icon| self.read_file(icon).ok())
+            .as_deref()
+            .and_then(parse_title)
+            .unwrap_or_else(|| fallback.to_owned())
+    }
+
+    /// Read a save directory into the shared save model for exporting.
+    pub fn export_save(&mut self, name: &str) -> Result<SaveImport> {
+        let save = self
+            .entries()?
+            .into_iter()
+            .find(|entry| entry.name == name)
+            .ok_or_else(|| anyhow!("save not found: {name}"))?;
+        ensure!(save.is_dir(), "not a save directory: {name}");
+        let children = self.directory_entries(save.first_cluster, save.length)?;
+        let mut files = Vec::new();
+        for child in children.iter().skip(2) {
+            if child.mode & DF_EXISTS == 0 {
+                continue;
+            }
+            if child.is_dir() {
+                bail!("refusing to export nested directory {}", child.name);
+            }
+            ensure!(
+                child.is_file(),
+                "unsupported directory entry: {}",
+                child.name
+            );
+            let data = self.read_file(child)?;
+            ensure!(
+                data.len() == child.length as usize,
+                "truncated file data: {}",
+                child.name
+            );
+            files.push(SaveFile {
+                name: child.name.clone(),
+                data,
+                mode: child.mode,
+                created: child.created,
+                modified: child.modified,
+            });
+        }
+        let title = self.icon_title(&children, &save.name);
+        Ok(SaveImport {
+            directory: save.name.clone(),
+            directory_mode: save.mode,
+            created: save.created,
+            modified: save.modified,
+            title,
+            files,
+        })
     }
 
     /// Free allocatable space in bytes.
@@ -914,6 +967,93 @@ mod tests {
         assert_eq!(summaries.len(), 1);
         assert_eq!(summaries[0].game_title, "BASLUS-TEST");
         assert_eq!(summaries[0].size_bytes, 100);
+        Ok(())
+    }
+
+    #[test]
+    fn export_save_round_trips_card_data() -> Result<()> {
+        let temp = tempdir()?;
+        let path = temp.path().join("card.ps2");
+        create_test_card(&path, false);
+        let icon = sample_icon_sys(b"Test Game", b"Save 1", 16);
+        let payload = vec![1, 2, 3, 4, 5];
+        let files = vec![
+            sample_file("icon.sys", icon),
+            sample_file("DATA.BIN", payload.clone()),
+        ];
+        MemoryCard::open(&path, true)?.add_directory(
+            "BASLUS-TEST",
+            0x8420,
+            [0; 8],
+            [0; 8],
+            &files,
+        )?;
+
+        let mut card = MemoryCard::open(&path, false)?;
+        let save = card.export_save("BASLUS-TEST")?;
+        assert_eq!(save.directory, "BASLUS-TEST");
+        assert_eq!(save.title, "Test Game Save 1");
+        assert_eq!(save.files.len(), 2);
+        let data = save
+            .files
+            .iter()
+            .find(|file| file.name == "DATA.BIN")
+            .unwrap();
+        assert_eq!(data.data, payload);
+
+        let encoded = crate::codebreaker::format::encode(&save)?;
+        let parsed = crate::save::SaveImport::parse(&encoded)?;
+        assert_eq!(parsed.directory, "BASLUS-TEST");
+        assert_eq!(parsed.title, "Test Game Save 1");
+        assert_eq!(parsed.files.len(), 2);
+        assert_eq!(
+            parsed
+                .files
+                .iter()
+                .find(|file| file.name == "DATA.BIN")
+                .unwrap()
+                .data,
+            payload
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn export_save_rejects_missing_and_nested_saves() -> Result<()> {
+        let temp = tempdir()?;
+        let path = temp.path().join("card.ps2");
+        create_test_card(&path, false);
+        let files = vec![sample_file("DATA", vec![1, 2, 3])];
+        MemoryCard::open(&path, true)?.add_directory(
+            "BASLUS-TEST",
+            0x8420,
+            [0; 8],
+            [0; 8],
+            &files,
+        )?;
+
+        let mut card = MemoryCard::open(&path, false)?;
+        assert!(card.export_save("NO-SUCH-SAVE").is_err());
+        drop(card);
+
+        let mut card = MemoryCard::open(&path, true)?;
+        let save = card
+            .entries()?
+            .into_iter()
+            .find(|entry| entry.name == "BASLUS-TEST")
+            .unwrap();
+        let children = card.directory_entries(save.first_cluster, save.length)?;
+        let index = children
+            .iter()
+            .position(|entry| entry.name == "DATA")
+            .unwrap();
+        let mut nested = children[index].clone();
+        nested.mode = DF_RWX | DF_DIR | DF_EXISTS;
+        card.write_directory_entry(save.first_cluster, index, &nested)?;
+        drop(card);
+
+        let mut card = MemoryCard::open(&path, false)?;
+        assert!(card.export_save("BASLUS-TEST").is_err());
         Ok(())
     }
 

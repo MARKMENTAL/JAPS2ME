@@ -20,11 +20,15 @@ const RC4S: [u8; 256] = [
 use crate::save::{SaveFile, SaveImport};
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use flate2::read::ZlibDecoder;
-use std::io::{Cursor, Read};
+use flate2::write::ZlibEncoder;
+use flate2::Compression;
+use std::io::{Cursor, Read, Write};
 
 const MAGIC: &[u8; 4] = b"CFU\0";
 const HEADER_MIN: usize = 124;
 const MAX_DECOMPRESSED_BODY: usize = 64 * 1024 * 1024;
+const DIRNAME_LEN: usize = 32;
+const FILENAME_LEN: usize = 32;
 
 pub type CodebreakerFileEntry = SaveFile;
 pub type CodebreakerSave = SaveImport;
@@ -149,9 +153,111 @@ pub fn parse(data: &[u8]) -> Result<SaveImport> {
     })
 }
 
+fn validate_entry_name(name: &str, what: &str) -> Result<()> {
+    ensure!(!name.is_empty(), "Codebreaker {what} name cannot be empty");
+    ensure!(
+        name.len() <= DIRNAME_LEN,
+        "Codebreaker {what} name must fit in 32 bytes: {name}"
+    );
+    ensure!(
+        !name.bytes().any(|byte| byte == 0),
+        "Codebreaker {what} name cannot contain NUL: {name}"
+    );
+    Ok(())
+}
+
+/// Encode a save as a Codebreaker `.cbs` file.
+///
+/// Mirrors [`parse`]: a `CFU\0` header with lengths, directory metadata,
+/// and title, followed by the RC4-encrypted zlib body of 64-byte file
+/// records plus raw file data.
+pub fn encode(save: &SaveImport) -> Result<Vec<u8>> {
+    validate_entry_name(&save.directory, "directory")?;
+    ensure!(
+        !save.title.bytes().any(|byte| byte == 0),
+        "Codebreaker title cannot contain NUL"
+    );
+    for file in &save.files {
+        validate_entry_name(&file.name, "file")?;
+        ensure!(
+            file.mode & 0x8030 == 0x8010,
+            "Codebreaker entry is not a regular file: {}",
+            file.name
+        );
+        u32::try_from(file.data.len()).context("file is too large for Codebreaker save")?;
+    }
+
+    let mut body = Vec::new();
+    for file in &save.files {
+        body.extend_from_slice(&file.created);
+        body.extend_from_slice(&file.modified);
+        body.extend_from_slice(
+            &u32::try_from(file.data.len())
+                .context("file is too large for Codebreaker save")?
+                .to_le_bytes(),
+        );
+        body.extend_from_slice(&file.mode.to_le_bytes());
+        body.extend_from_slice(&[0u8; 2]); // reserved
+        body.extend_from_slice(&[0u8; 8]); // reserved
+        let mut name_field = [0u8; FILENAME_LEN];
+        name_field[..file.name.len()].copy_from_slice(file.name.as_bytes());
+        body.extend_from_slice(&name_field);
+        body.extend_from_slice(&file.data);
+    }
+    ensure!(
+        body.len() <= MAX_DECOMPRESSED_BODY,
+        "Codebreaker body exceeds size limit"
+    );
+
+    let mut encoder = ZlibEncoder::new(Vec::new(), Compression::default());
+    encoder
+        .write_all(&body)
+        .context("compressing Codebreaker save body")?;
+    let encrypted = crypt(
+        encoder
+            .finish()
+            .context("compressing Codebreaker save body")?,
+    );
+
+    let title_bytes = save.title.as_bytes();
+    let header_len = HEADER_MIN.max(
+        92usize
+            .checked_add(title_bytes.len())
+            .and_then(|len| len.checked_add(1))
+            .ok_or_else(|| anyhow!("Codebreaker title is too long"))?,
+    );
+    let stored_len = header_len
+        .checked_add(encrypted.len())
+        .ok_or_else(|| anyhow!("Codebreaker save is too large"))?;
+    let header_len_u32 = u32::try_from(header_len).context("Codebreaker header is too large")?;
+    let stored_len_u32 = u32::try_from(stored_len).context("Codebreaker save is too large")?;
+    let body_len_u32 = u32::try_from(body.len()).context("Codebreaker body is too large")?;
+
+    let directory_mode = if save.directory_mode & 0x8030 == 0x8020 {
+        u32::from(save.directory_mode)
+    } else {
+        0x8427 // RWX | directory | 0400 | exists
+    };
+
+    let mut header = vec![0u8; header_len];
+    header[0..4].copy_from_slice(MAGIC);
+    header[8..12].copy_from_slice(&header_len_u32.to_le_bytes());
+    header[12..16].copy_from_slice(&body_len_u32.to_le_bytes());
+    header[16..20].copy_from_slice(&stored_len_u32.to_le_bytes());
+    header[20..20 + save.directory.len()].copy_from_slice(save.directory.as_bytes());
+    header[52..60].copy_from_slice(&save.created);
+    header[60..68].copy_from_slice(&save.modified);
+    header[76..80].copy_from_slice(&directory_mode.to_le_bytes());
+    header[92..92 + title_bytes.len()].copy_from_slice(title_bytes);
+
+    header.extend_from_slice(&encrypted);
+    Ok(header)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{crypt, parse};
+    use super::{crypt, encode, parse};
+    use crate::save::{SaveFile, SaveImport};
     use flate2::write::ZlibEncoder;
     use flate2::Compression;
     use std::io::Write;
@@ -202,5 +308,92 @@ mod tests {
         let mut cbs = sample_cbs();
         cbs.truncate(100);
         assert!(parse(&cbs).is_err());
+    }
+
+    fn sample_save() -> SaveImport {
+        SaveImport {
+            directory: "BASLUS-TEST".to_owned(),
+            directory_mode: 0x8420,
+            created: [0, 1, 2, 3, 4, 5, 0xe8, 0x07],
+            modified: [0, 6, 7, 8, 9, 5, 0xe8, 0x07],
+            title: "Test Save".to_owned(),
+            files: vec![
+                SaveFile {
+                    name: "DATA.BIN".to_owned(),
+                    data: vec![0xaa, 0xbb, 0xcc],
+                    mode: 0x8017,
+                    created: [0, 1, 2, 3, 4, 5, 0xe8, 0x07],
+                    modified: [0, 6, 7, 8, 9, 5, 0xe8, 0x07],
+                },
+                SaveFile {
+                    name: "EMPTY".to_owned(),
+                    data: vec![],
+                    mode: 0x8417,
+                    created: [0; 8],
+                    modified: [0; 8],
+                },
+            ],
+        }
+    }
+
+    fn assert_same_save(expected: &SaveImport, actual: &SaveImport) {
+        assert_eq!(actual.directory, expected.directory);
+        assert_eq!(actual.directory_mode, expected.directory_mode);
+        assert_eq!(actual.created, expected.created);
+        assert_eq!(actual.modified, expected.modified);
+        assert_eq!(actual.title, expected.title);
+        assert_eq!(actual.files.len(), expected.files.len());
+        for (actual, expected) in actual.files.iter().zip(expected.files.iter()) {
+            assert_eq!(actual.name, expected.name);
+            assert_eq!(actual.data, expected.data);
+            assert_eq!(actual.mode, expected.mode);
+            assert_eq!(actual.created, expected.created);
+            assert_eq!(actual.modified, expected.modified);
+        }
+    }
+
+    #[test]
+    fn encode_round_trips_through_parse() {
+        let save = sample_save();
+        let encoded = encode(&save).unwrap();
+        let parsed = parse(&encoded).unwrap();
+        assert_same_save(&save, &parsed);
+    }
+
+    #[test]
+    fn parsed_save_reencodes_to_equivalent_save() {
+        let parsed = parse(&sample_cbs()).unwrap();
+        let reencoded = encode(&parsed).unwrap();
+        let reparsed = parse(&reencoded).unwrap();
+        assert_same_save(&parsed, &reparsed);
+    }
+
+    #[test]
+    fn encode_grows_header_for_long_titles() {
+        let mut save = sample_save();
+        save.title = "A".repeat(200);
+        let encoded = encode(&save).unwrap();
+        let header_len = u32::from_le_bytes(encoded[8..12].try_into().unwrap()) as usize;
+        assert_eq!(header_len, 92 + 200 + 1);
+        assert_eq!(parse(&encoded).unwrap().title, save.title);
+    }
+
+    #[test]
+    fn encode_rejects_invalid_names_and_modes() {
+        let mut save = sample_save();
+        save.directory.clear();
+        assert!(encode(&save).is_err());
+
+        let mut save = sample_save();
+        save.directory = "X".repeat(33);
+        assert!(encode(&save).is_err());
+
+        let mut save = sample_save();
+        save.files[0].name = "not-a-file\0name".to_owned();
+        assert!(encode(&save).is_err());
+
+        let mut save = sample_save();
+        save.files[0].mode = 0x8427; // directory mode, not a regular file
+        assert!(encode(&save).is_err());
     }
 }

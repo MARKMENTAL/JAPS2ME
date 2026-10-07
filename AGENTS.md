@@ -7,6 +7,7 @@ JAPS2ME (Just A PS2 Memory Card Editor) is a Rust CLI and library for managing P
 - `list <CARD.ps2>` — list saves as a Unicode table with game titles, file counts, payload sizes, and free space.
 - `delete <CARD.ps2> <SAVE-DIRECTORY>` — remove a save directory.
 - `add <CARD.ps2> <SAVE.cbs|SAVE.max>` — import a Codebreaker or Datel MAX Drive save.
+- `export <CARD.ps2> <SAVE-DIRECTORY> <OUTPUT.cbs>` — export a save as a Codebreaker file.
 
 The project is licensed under GPL-3.0-or-later. `mymcplusplus` is a technical reference for PS2 memory-card filesystem behavior and save formats; see its attribution in `README.md`.
 
@@ -17,9 +18,9 @@ The project is licensed under GPL-3.0-or-later. `mymcplusplus` is a technical re
 - `src/memory_card/icon_sys.rs` — `icon.sys` title parsing with Shift-JIS decoding.
 - `src/lib.rs` — crate modules and public exports.
 - `src/save.rs` — shared imported-save model and format detection.
-- `src/codebreaker/format.rs` — Codebreaker RC4/zlib parser.
+- `src/codebreaker/format.rs` — Codebreaker RC4/zlib parser and encoder.
 - `src/max_drive.rs` — MAX Drive header/CRC parser, LZARI decoder, and file-record parser.
-- `src/memory_card/card.rs` — memory-card access, directory operations, allocation, FAT chains, and save insertion/removal.
+- `src/memory_card/card.rs` — memory-card access, directory operations, allocation, FAT chains, save insertion/removal, summaries, and save export.
 - `src/memory_card/superblock.rs` — superblock parsing and card geometry.
 - `src/memory_card/directory.rs` — 512-byte directory-entry encoding and mode bits.
 - `src/memory_card/fat.rs` — FAT marker constants and helpers.
@@ -61,7 +62,7 @@ After changing code, rebuild the executable being invoked. For example, `cargo b
 
 ## Save-format details
 
-- Codebreaker files begin with `CFU\0`. Their body is RC4-decrypted using the fixed Codebreaker state, then zlib-decompressed. Header and per-file lengths must be bounds-checked.
+- Codebreaker files begin with `CFU\0`. Their body is RC4-decrypted using the fixed Codebreaker state, then zlib-decompressed. Header and per-file lengths must be bounds-checked. The encoder mirrors this layout: 64-byte file records plus raw data, zlib-compressed and RC4-encrypted, with `stored_len` set to the total file length and overlong headers grown past the 124-byte minimum for long titles.
 - MAX Drive files begin with `Ps2PowerSave` and have a 92-byte header. The CRC is computed over the header with its CRC field zeroed followed by the compressed payload. The LZARI output contains `dirlen` records: little-endian data length, 32-byte name, file bytes, and the format's alignment padding.
 - The supplied `PES3allunlocked.max` fixture should parse as directory `BESLES-51912PES3OPT`, with `icon.sys` (964 bytes), `icon_view` (33,400 bytes), and `BESLES-51912PES3OPT` (773,120 bytes). Tests use CRCs of the decoded files to catch LZARI regressions.
 
