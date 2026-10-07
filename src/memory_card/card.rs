@@ -244,7 +244,10 @@ impl MemoryCard {
         Ok(())
     }
 
-    fn write_file_data(&mut self, data: &[u8]) -> Result<u32> {
+    fn write_file_data<F>(&mut self, data: &[u8], payload_progress: &mut F) -> Result<u32>
+    where
+        F: FnMut(u64),
+    {
         if data.is_empty() {
             return Ok(CHAIN_END);
         }
@@ -262,6 +265,7 @@ impl MemoryCard {
             let mut padded = vec![0; cluster_size];
             padded[..chunk.len()].copy_from_slice(chunk);
             self.write_cluster(cluster, &padded)?;
+            payload_progress(chunk.len() as u64);
             previous = Some(cluster);
         }
         Ok(first)
@@ -487,6 +491,7 @@ impl MemoryCard {
             .ok_or_else(|| anyhow!("total-space calculation overflow"))
     }
 
+    #[cfg(test)]
     pub(crate) fn add_directory(
         &mut self,
         name: &str,
@@ -495,6 +500,21 @@ impl MemoryCard {
         modified: [u8; 8],
         files: &[ImportFile],
     ) -> Result<()> {
+        self.add_directory_with_progress(name, directory_mode, created, modified, files, |_| {})
+    }
+
+    pub(crate) fn add_directory_with_progress<F>(
+        &mut self,
+        name: &str,
+        directory_mode: u16,
+        created: [u8; 8],
+        modified: [u8; 8],
+        files: &[ImportFile],
+        mut payload_progress: F,
+    ) -> Result<()>
+    where
+        F: FnMut(u64),
+    {
         validate_name(name)?;
         ensure!(directory_mode & DF_DIR != 0, "save mode is not a directory");
         if self.entries()?.iter().any(|entry| entry.name == name) {
@@ -543,7 +563,7 @@ impl MemoryCard {
 
         let mut directory_entry_count = 2u32;
         for file in files {
-            let first_file_cluster = self.write_file_data(&file.data)?;
+            let first_file_cluster = self.write_file_data(&file.data, &mut payload_progress)?;
             let file_entry = DirEntry {
                 mode: (file.mode & !DF_DIR) | DF_FILE | DF_EXISTS,
                 length: u32::try_from(file.data.len())
@@ -891,6 +911,53 @@ mod tests {
         let result = add_directory_atomically(&path, "NEW-SAVE", 0x8420, [0; 8], [0; 8], &files);
         assert!(result.is_err());
         assert_eq!(fs::read(&path)?, original);
+        Ok(())
+    }
+
+    #[test]
+    fn atomic_import_reports_progress_through_commit() -> Result<()> {
+        use crate::memory_card::transaction::{
+            add_directory_atomically_with_progress, AddProgress,
+        };
+
+        let temp = tempdir()?;
+        let path = temp.path().join("card.ps2");
+        create_test_card(&path, false);
+        let card_size = fs::metadata(&path)?.len();
+        let payload = vec![0x5a; 2500];
+        let files = vec![sample_file("DATA", payload.clone())];
+        let mut events = Vec::new();
+
+        add_directory_atomically_with_progress(
+            &path,
+            "NEW-SAVE",
+            0x8420,
+            [0; 8],
+            [0; 8],
+            &files,
+            |event| events.push(event),
+        )?;
+
+        assert_eq!(
+            events.first(),
+            Some(&AddProgress::CopyingCard {
+                bytes_copied: 0,
+                total_bytes: card_size,
+            })
+        );
+        assert!(events.contains(&AddProgress::CopyingCard {
+            bytes_copied: card_size,
+            total_bytes: card_size,
+        }));
+        assert!(events.contains(&AddProgress::WritingSave {
+            bytes_written: payload.len() as u64,
+            total_bytes: payload.len() as u64,
+        }));
+        assert!(events.contains(&AddProgress::VerifyingSave {
+            files_verified: 1,
+            total_files: 1,
+        }));
+        assert_eq!(events.last(), Some(&AddProgress::Committing));
         Ok(())
     }
 

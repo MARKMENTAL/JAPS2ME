@@ -1,5 +1,4 @@
 /target
+backup-saves/
 *.ps2
-*.max
-*.cbs
 mymcplusplus-reference/

@@ -370,7 +370,7 @@ mod lzari {
 mod tests {
     use super::{parse, MAGIC};
 
-    const PES3_MAX: &[u8] = include_bytes!("../PES3allunlocked.max");
+    const PES3_MAX: &[u8] = include_bytes!("../save-games/PES3allunlocked.max");
 
     #[test]
     fn parses_pes3_max_save_and_decodes_files() {
