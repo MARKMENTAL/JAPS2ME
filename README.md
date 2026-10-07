@@ -1,16 +1,13 @@
 # JAPS2ME
 
-**Just A PS2 Memory Card Editor** is a command-line tool for managing PCSX2 PlayStation 2 memory-card images. It can list and delete save directories, import CodeBreaker `.cbs` and Datel MAX Drive `.max` saves, and export saves as CodeBreaker files.
-
-> **Early development:** Back up your memory-card image before using JAPS2ME. Avoid editing a card while it is open in PCSX2. Although imports are staged and validated before replacing the image, keep an independent backup.
+**Just A PS2 Memory Card Editor** is a command-line tool for managing PCSX2 PlayStation 2 memory-card images. It works with card images directly, imports CodeBreaker `.cbs` and Datel MAX Drive `.max` saves, and exports CodeBreaker saves.
 
 ## Features
 
-- List saves as a Unicode table with directory names, game titles, file counts, payload sizes, and free-space footer.
-- Delete a save directory.
-- Export a save directory as a CodeBreaker `.cbs` file.
-- Import CodeBreaker `.cbs` and Datel MAX Drive `.max` saves, including their files and supported metadata. Interactive terminals show progress while the card is copied, the save is written and verified, and the result is committed.
-- Read and update standard PS2 memory-card images with ECC support.
+- Browse root saves with game titles, file counts, payload sizes, and card free space.
+- Import `.cbs` and `.max` saves with staged validation and interactive progress.
+- Delete save directories and export saves as `.cbs` files.
+- Read plain and ECC-bearing memory-card images; regenerate ECC when writing.
 
 ## Build
 
@@ -24,44 +21,64 @@ The executable is created at `target/release/japs2me`.
 
 ## Usage
 
-```text
-japs2me --version
-japs2me list <CARD.ps2>
-japs2me delete <CARD.ps2> <SAVE-DIRECTORY>
-japs2me add <CARD.ps2> <SAVE.cbs|SAVE.max>
-japs2me export <CARD.ps2> <SAVE-DIRECTORY> <OUTPUT.cbs>
-```
+| Command | Purpose |
+| --- | --- |
+| `japs2me --version` | Print the version (`-V` is also supported). |
+| `japs2me list <CARD.ps2>` | List root saves and card free space. |
+| `japs2me add <CARD.ps2> <SAVE>` | Import a CodeBreaker `.cbs` or MAX Drive `.max` save. |
+| `japs2me delete <CARD.ps2> <SAVE-DIRECTORY>` | Delete a save directory. |
+| `japs2me export <CARD.ps2> <SAVE-DIRECTORY> <OUTPUT.cbs>` | Export a save as CodeBreaker. |
 
 Examples:
 
 ```sh
 target/release/japs2me list Mcd001.ps2
-target/release/japs2me add Mcd001.ps2 my-save.cbs
-target/release/japs2me add Mcd001.ps2 PES3allunlocked.max
+target/release/japs2me add Mcd001.ps2 save-games/PES3allunlocked.max
 target/release/japs2me delete Mcd001.ps2 BASLUS-20787SD5
 target/release/japs2me export Mcd001.ps2 BESLES-51912PES3OPT pes3.cbs
 ```
 
-`list` displays saves as a Unicode table with the save directory, game title from `icon.sys` (falling back to the directory name), regular-file count, and total payload size. A footer shows free allocatable space. Game titles are decoded from the Shift-JIS `icon.sys` title field; missing or invalid metadata falls back to the directory name. Listed save sizes are summed file payload bytes, not on-card allocated cluster sizes. Free space is unallocated FAT clusters multiplied by the cluster size. `add` detects CodeBreaker and MAX Drive saves by their file signatures, uses the directory name stored in the save, and reports an error if that save already exists on the card. `export` writes the save directory's files, modes, and timestamps to a CodeBreaker `.cbs` file, using the `icon.sys` title when available, and refuses to overwrite an existing output file.
+### `list`
 
-`--version` (also `-V`) prints the package version and exits. Imports are staged and validated before the card image is replaced; `delete` writes directly to the target card, so keep an independent backup and close PCSX2 before using it. See the [curated save-games collection](save-games/README.md) for the saves included in this repository.
+- Shows each root save's directory name, game title, regular-file count, and total payload size.
+- Reads game titles from `icon.sys`; falls back to the directory name if the metadata is missing or invalid.
+- The footer reports free and total allocatable space. Save sizes are payload bytes, not allocated cluster sizes.
+
+### `add`
+
+- Detects `.cbs` and `.max` files by signature and uses the directory name stored in the save.
+- Rejects a save if that directory already exists on the card.
+- On interactive terminals, progress is shown while the card is copied, the save is written and verified, and the staged image is committed. Progress is hidden when stderr is not a terminal.
+
+### `delete`
+
+Deletes the named root save directory. Unlike imports, deletion currently writes directly to the target card image.
+
+### `export`
+
+Exports a save's files, modes, and timestamps as a CodeBreaker `.cbs` file. The title comes from `icon.sys` when available. Existing output files are not overwritten.
+
+## Safety
+
+- Back up the memory-card image before editing it.
+- Keep PCSX2 closed while changing a card.
+- Imports are staged and validated before replacing the original image; deletion writes directly to the target.
+- Avoid testing writes against your only card image or a supplied fixture.
 
 ## Scope compared with mymcplusplus
 
 JAPS2ME focuses on importing, exporting, and basic save management rather than general filesystem access:
 
-- `list` shows root save directories with titles, file counts, and payload sizes; it does not browse arbitrary directories. Free and total space appear in the `list` footer instead of a separate `df` command.
-- `add` combines mymcplusplus's `add` and `import` into one step that installs a complete `.cbs` or `.max` save.
-- `export` writes a save as CodeBreaker `.cbs` only.
-- `delete` removes a named root save directory; arbitrary file or directory management is not supported.
-- There is no GUI, file extraction, filesystem check, card formatting, mode-flag editing, or ECC override option. Standard images with or without ECC spare areas are handled automatically, and ECC is regenerated on writes.
+- `list` covers root saves; free-space information is included instead of a separate `df` command.
+- `add` combines mymcplusplus's `add` and `import` workflows to install a complete `.cbs` or `.max` save.
+- `export` supports CodeBreaker `.cbs` only.
+- There is no GUI, file extraction, filesystem check, card formatting, mode-flag editing, or ECC override option. JAPS2ME handles plain and ECC-bearing images automatically and regenerates ECC on writes.
 
-For details on the `.cbs` and `.max` containers and the PS2 memory-card filesystem,
-see the [technical format guide](docs/FORMATS.md).
+For details about the save containers and PS2 memory-card filesystem, see the [technical format guide](docs/FORMATS.md). The [curated save-games collection](save-games/README.md) lists the saves shared in this repository.
 
 ## Tests
 
-Run the test suite and lint checks with:
+Run formatting, tests, lint checks, and a release build from the repository root:
 
 ```sh
 cargo fmt --check
@@ -72,7 +89,7 @@ cargo build --release
 
 ## License
 
-JAPS2ME is licensed under the **GNU General Public License, version 3 or (at your option) any later version** (SPDX: `GPL-3.0-or-later`).
+JAPS2ME is licensed under the **GNU General Public License, version 3 or (at your option) any later version** (SPDX: `GPL-3.0-or-later`). This project license does not automatically apply to the individual save files in `save-games/`; see that directory's README for contribution and attribution guidance.
 
 ## Acknowledgements
 
