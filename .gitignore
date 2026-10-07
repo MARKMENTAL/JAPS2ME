@@ -1,4 +1,5 @@
 /target
 *.ps2
+*.max
 *.cbs
 mymcplusplus-reference/

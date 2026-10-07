@@ -17,6 +17,7 @@ const RC4S: [u8; 256] = [
     0x8a, 0xd9, 0xec, 0x27, 0x44, 0x0e, 0x33, 0xc8, 0x6b, 0x93, 0x32, 0x48, 0xb6, 0x30, 0x43, 0xa5,
 ];
 
+use crate::save::{SaveFile, SaveImport};
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use flate2::read::ZlibDecoder;
 use std::io::{Cursor, Read};
@@ -25,24 +26,8 @@ const MAGIC: &[u8; 4] = b"CFU\0";
 const HEADER_MIN: usize = 124;
 const MAX_DECOMPRESSED_BODY: usize = 64 * 1024 * 1024;
 
-#[derive(Debug, Clone)]
-pub struct CodebreakerFileEntry {
-    pub name: String,
-    pub data: Vec<u8>,
-    pub mode: u16,
-    pub created: [u8; 8],
-    pub modified: [u8; 8],
-}
-
-#[derive(Debug, Clone)]
-pub struct CodebreakerSave {
-    pub directory: String,
-    pub directory_mode: u16,
-    pub created: [u8; 8],
-    pub modified: [u8; 8],
-    pub title: String,
-    pub files: Vec<CodebreakerFileEntry>,
-}
+pub type CodebreakerFileEntry = SaveFile;
+pub type CodebreakerSave = SaveImport;
 
 fn crypt(mut data: Vec<u8>) -> Vec<u8> {
     let mut state = RC4S;
@@ -73,106 +58,100 @@ fn slice<const N: usize>(data: &[u8], offset: usize) -> Result<[u8; N]> {
     .map_err(|_| anyhow!("truncated Codebreaker header"))
 }
 
-impl CodebreakerSave {
-    pub fn parse(data: &[u8]) -> Result<Self> {
-        ensure!(data.len() >= 12, "Codebreaker file is too short");
-        ensure!(&data[..4] == MAGIC, "not a Codebreaker save");
+pub fn parse(data: &[u8]) -> Result<SaveImport> {
+    ensure!(data.len() >= 12, "Codebreaker file is too short");
+    ensure!(&data[..4] == MAGIC, "not a Codebreaker save");
 
-        let header_len = u32::from_le_bytes(slice::<4>(data, 8)?) as usize;
-        ensure!(header_len >= HEADER_MIN, "Codebreaker header is too short");
-        ensure!(header_len <= data.len(), "truncated Codebreaker header");
+    let header_len = u32::from_le_bytes(slice::<4>(data, 8)?) as usize;
+    ensure!(header_len >= HEADER_MIN, "Codebreaker header is too short");
+    ensure!(header_len <= data.len(), "truncated Codebreaker header");
 
-        let decompressed_len = u32::from_le_bytes(slice::<4>(data, 12)?) as usize;
-        let stored_len = u32::from_le_bytes(slice::<4>(data, 16)?) as usize;
+    let decompressed_len = u32::from_le_bytes(slice::<4>(data, 12)?) as usize;
+    let stored_len = u32::from_le_bytes(slice::<4>(data, 16)?) as usize;
+    ensure!(
+        decompressed_len <= MAX_DECOMPRESSED_BODY,
+        "Codebreaker body exceeds size limit"
+    );
+    ensure!(
+        stored_len == data.len() || stored_len == data.len() - header_len,
+        "Codebreaker body length does not match header"
+    );
+
+    let encrypted_body = crypt(data[header_len..].to_vec());
+    let decoder = ZlibDecoder::new(Cursor::new(encrypted_body));
+    let mut body = Vec::with_capacity(decompressed_len);
+    decoder
+        .take((decompressed_len as u64).saturating_add(1))
+        .read_to_end(&mut body)
+        .context("decompressing Codebreaker save body")?;
+    ensure!(
+        body.len() == decompressed_len,
+        "decompressed Codebreaker body length mismatch"
+    );
+
+    let directory = read_string(&data[20..52]);
+    let created = slice::<8>(data, 52)?;
+    let modified = slice::<8>(data, 60)?;
+    let raw_directory_mode = u32::from_le_bytes(slice::<4>(data, 76)?) as u16;
+    let directory_mode = if raw_directory_mode & 0x8030 == 0x8020 {
+        raw_directory_mode
+    } else {
+        0x8427 // RWX | directory | 0400 | exists
+    };
+    let title = read_string(&data[92..header_len]);
+
+    let mut files = Vec::new();
+    let mut offset = 0usize;
+    while offset < body.len() {
         ensure!(
-            decompressed_len <= MAX_DECOMPRESSED_BODY,
-            "Codebreaker body exceeds size limit"
+            body.len() - offset >= 64,
+            "truncated Codebreaker file header"
         );
+        let created = slice::<8>(&body, offset)?;
+        let modified = slice::<8>(&body, offset + 8)?;
+        let size = u32::from_le_bytes(slice::<4>(&body, offset + 16)?) as usize;
+        let mode = u16::from_le_bytes(slice::<2>(&body, offset + 20)?);
+        let name = read_string(&body[offset + 32..offset + 64]);
         ensure!(
-            stored_len == data.len() || stored_len == data.len() - header_len,
-            "Codebreaker body length does not match header"
+            mode & 0x8030 == 0x8010,
+            "Codebreaker entry is not a regular file: {name}"
         );
 
-        let encrypted_body = crypt(data[header_len..].to_vec());
-        let decoder = ZlibDecoder::new(Cursor::new(encrypted_body));
-        let mut body = Vec::with_capacity(decompressed_len);
-        decoder
-            .take((decompressed_len as u64).saturating_add(1))
-            .read_to_end(&mut body)
-            .context("decompressing Codebreaker save body")?;
-        ensure!(
-            body.len() == decompressed_len,
-            "decompressed Codebreaker body length mismatch"
-        );
-
-        let directory = read_string(&data[20..52]);
-        let created = slice::<8>(data, 52)?;
-        let modified = slice::<8>(data, 60)?;
-        let raw_directory_mode = u32::from_le_bytes(slice::<4>(data, 76)?) as u16;
-        let directory_mode = if raw_directory_mode & 0x8030 == 0x8020 {
-            raw_directory_mode
-        } else {
-            0x8427 // RWX | directory | 0400 | exists
-        };
-        let title = read_string(&data[92..header_len]);
-
-        let mut files = Vec::new();
-        let mut offset = 0usize;
-        while offset < body.len() {
-            ensure!(
-                body.len() - offset >= 64,
-                "truncated Codebreaker file header"
-            );
-            let created = slice::<8>(&body, offset)?;
-            let modified = slice::<8>(&body, offset + 8)?;
-            let size = u32::from_le_bytes(slice::<4>(&body, offset + 16)?) as usize;
-            let mode = u16::from_le_bytes(slice::<2>(&body, offset + 20)?);
-            let name = read_string(&body[offset + 32..offset + 64]);
-            ensure!(
-                mode & 0x8030 == 0x8010,
-                "Codebreaker entry is not a regular file: {name}"
-            );
-
-            let data_start = offset
-                .checked_add(64)
-                .ok_or_else(|| anyhow!("file offset overflow"))?;
-            let data_end = data_start
-                .checked_add(size)
-                .ok_or_else(|| anyhow!("file size overflow"))?;
-            let file_data = body
-                .get(data_start..data_end)
-                .ok_or_else(|| anyhow!("truncated Codebreaker file data: {name}"))?;
-            files.push(CodebreakerFileEntry {
-                name,
-                data: file_data.to_vec(),
-                mode,
-                created,
-                modified,
-            });
-            offset = data_end;
-        }
-
-        if directory.is_empty() {
-            bail!("Codebreaker save has an empty directory name");
-        }
-        Ok(Self {
-            directory,
-            directory_mode,
+        let data_start = offset
+            .checked_add(64)
+            .ok_or_else(|| anyhow!("file offset overflow"))?;
+        let data_end = data_start
+            .checked_add(size)
+            .ok_or_else(|| anyhow!("file size overflow"))?;
+        let file_data = body
+            .get(data_start..data_end)
+            .ok_or_else(|| anyhow!("truncated Codebreaker file data: {name}"))?;
+        files.push(SaveFile {
+            name,
+            data: file_data.to_vec(),
+            mode,
             created,
             modified,
-            title,
-            files,
-        })
+        });
+        offset = data_end;
     }
 
-    pub fn from_file(path: &std::path::Path) -> Result<Self> {
-        Self::parse(&std::fs::read(path).with_context(|| format!("reading {}", path.display()))?)
+    if directory.is_empty() {
+        bail!("Codebreaker save has an empty directory name");
     }
+    Ok(SaveImport {
+        directory,
+        directory_mode,
+        created,
+        modified,
+        title,
+        files,
+    })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{crypt, CodebreakerSave};
+    use super::{crypt, parse};
     use flate2::write::ZlibEncoder;
     use flate2::Compression;
     use std::io::Write;
@@ -207,7 +186,7 @@ mod tests {
 
     #[test]
     fn parses_header_metadata_and_file_record() {
-        let save = CodebreakerSave::parse(&sample_cbs()).unwrap();
+        let save = parse(&sample_cbs()).unwrap();
         assert_eq!(save.directory, "BASLUS-TEST");
         assert_eq!(save.title, "Test Save");
         assert_eq!(save.directory_mode, 0x8420);
@@ -219,9 +198,9 @@ mod tests {
 
     #[test]
     fn rejects_truncated_or_inconsistent_cbs() {
-        assert!(CodebreakerSave::parse(b"CFU\0").is_err());
+        assert!(parse(b"CFU\0").is_err());
         let mut cbs = sample_cbs();
         cbs.truncate(100);
-        assert!(CodebreakerSave::parse(&cbs).is_err());
+        assert!(parse(&cbs).is_err());
     }
 }

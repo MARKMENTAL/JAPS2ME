@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use japs2me::memory_card::transaction::add_directory_atomically;
-use japs2me::{CodebreakerSave, ImportFile, MemoryCard};
+use japs2me::{ImportFile, MemoryCard, SaveImport};
 use std::path::Path;
 
 #[derive(Parser)]
@@ -31,7 +31,7 @@ fn main() -> Result<()> {
             card.remove(&name)?;
         }
         Command::Add { card, save } => {
-            let save = CodebreakerSave::from_file(Path::new(&save))?;
+            let save = SaveImport::from_file(Path::new(&save))?;
             let files = save
                 .files
                 .iter()
