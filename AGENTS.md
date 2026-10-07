@@ -4,7 +4,7 @@
 
 JAPS2ME (Just A PS2 Memory Card Editor) is a Rust CLI and library for managing PCSX2 PlayStation 2 memory-card images. Current CLI commands:
 
-- `list <CARD.ps2>` — list root save directories.
+- `list <CARD.ps2>` — list saves as a Unicode table with game titles, file counts, payload sizes, and free space.
 - `delete <CARD.ps2> <SAVE-DIRECTORY>` — remove a save directory.
 - `add <CARD.ps2> <SAVE.cbs|SAVE.max>` — import a Codebreaker or Datel MAX Drive save.
 
@@ -13,6 +13,8 @@ The project is licensed under GPL-3.0-or-later. `mymcplusplus` is a technical re
 ## Repository map
 
 - `src/main.rs` — Clap CLI and command dispatch.
+- `src/commands/list.rs` — Unicode table rendering and byte-size formatting for `list`.
+- `src/memory_card/icon_sys.rs` — `icon.sys` title parsing with Shift-JIS decoding.
 - `src/lib.rs` — crate modules and public exports.
 - `src/save.rs` — shared imported-save model and format detection.
 - `src/codebreaker/format.rs` — Codebreaker RC4/zlib parser.
@@ -55,6 +57,7 @@ After changing code, rebuild the executable being invoked. For example, `cargo b
 - A save directory's `.` and `..` entries have length zero. The save-directory entry in its parent (normally the root) stores the number of directory entries, including `.` and `..`.
 - When changing page data on ECC-bearing cards, regenerate the page's spare-area ECC. Do not write only page data while leaving stale ECC bytes.
 - MAX and Codebreaker inputs should be fully validated before the staged card replaces the original. Preserve file names, payload bytes, supported modes, and timestamps as appropriate for their source format.
+- `list` summaries count regular files only and sum their stored byte lengths; directory entries such as `.` and `..` are excluded. Free space is unallocated FAT clusters times the cluster size and is distinct from on-card allocated space.
 
 ## Save-format details
 

@@ -1,6 +1,7 @@
 use super::directory::{DirEntry, DF_DIR, DF_EXISTS, DF_FILE, DF_RWX, DIRENT_SIZE};
 use super::ecc::page_spare;
 use super::fat::{ALLOCATED, CHAIN_END, CHAIN_END_UNALLOC};
+use super::icon_sys::parse_title;
 use super::superblock::Superblock;
 use anyhow::{anyhow, bail, ensure, Context, Result};
 use std::collections::HashSet;
@@ -18,6 +19,15 @@ pub struct ImportFile {
     pub mode: u16,
     pub created: [u8; 8],
     pub modified: [u8; 8],
+}
+
+/// Human-readable summary of one save directory on the card.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SaveSummary {
+    pub directory: String,
+    pub game_title: String,
+    pub file_count: usize,
+    pub size_bytes: u64,
 }
 
 pub struct MemoryCard {
@@ -373,6 +383,57 @@ impl MemoryCard {
             .collect())
     }
 
+    /// Summarize each save directory with its game title and payload size.
+    pub fn save_summaries(&mut self) -> Result<Vec<SaveSummary>> {
+        let root_entries = self.entries()?;
+        let mut summaries = Vec::new();
+        for save in root_entries.into_iter().filter(|entry| entry.is_dir()) {
+            let children = self.directory_entries(save.first_cluster, save.length)?;
+            let files: Vec<&DirEntry> = children.iter().filter(|entry| entry.is_file()).collect();
+            let mut size_bytes = 0u64;
+            for file in &files {
+                size_bytes = size_bytes
+                    .checked_add(u64::from(file.length))
+                    .ok_or_else(|| anyhow!("save size overflow"))?;
+            }
+            let game_title = files
+                .iter()
+                .find(|file| file.name.eq_ignore_ascii_case("icon.sys"))
+                .filter(|icon| icon.length == 964)
+                .and_then(|icon| self.read_file(icon).ok())
+                .as_deref()
+                .and_then(parse_title)
+                .unwrap_or_else(|| save.name.clone());
+            summaries.push(SaveSummary {
+                directory: save.name.clone(),
+                game_title,
+                file_count: files.len(),
+                size_bytes,
+            });
+        }
+        Ok(summaries)
+    }
+
+    /// Free allocatable space in bytes.
+    pub fn available_bytes(&mut self) -> Result<u64> {
+        let mut free_clusters = 0u64;
+        for cluster in 0..self.superblock.allocatable_cluster_end {
+            if self.fat_entry(cluster)? & ALLOCATED == 0 {
+                free_clusters += 1;
+            }
+        }
+        free_clusters
+            .checked_mul(u64::from(self.superblock.cluster_size()))
+            .ok_or_else(|| anyhow!("free-space calculation overflow"))
+    }
+
+    /// Total allocatable space in bytes.
+    pub fn total_bytes(&self) -> Result<u64> {
+        u64::from(self.superblock.allocatable_cluster_end)
+            .checked_mul(u64::from(self.superblock.cluster_size()))
+            .ok_or_else(|| anyhow!("total-space calculation overflow"))
+    }
+
     pub(crate) fn add_directory(
         &mut self,
         name: &str,
@@ -672,6 +733,22 @@ mod tests {
         }
     }
 
+    fn sample_icon_sys(first: &[u8], second: &[u8], split: u16) -> Vec<u8> {
+        let mut data = vec![0u8; 964];
+        data[0..4].copy_from_slice(b"PS2D");
+        data[6..8].copy_from_slice(&split.to_le_bytes());
+        let split = split as usize;
+        for byte in data[192..192 + 68].iter_mut() {
+            *byte = b' ';
+        }
+        data[192..192 + first.len().min(split)].copy_from_slice(&first[..first.len().min(split)]);
+        let second_start = 192 + split;
+        let second_len = second.len().min(68 - split);
+        data[second_start..second_start + second_len].copy_from_slice(&second[..second_len]);
+        data[second_start + second_len] = 0;
+        data
+    }
+
     #[test]
     fn imports_directory_and_multicluster_files() -> Result<()> {
         let temp = tempdir()?;
@@ -761,6 +838,106 @@ mod tests {
         let result = add_directory_atomically(&path, "NEW-SAVE", 0x8420, [0; 8], [0; 8], &files);
         assert!(result.is_err());
         assert_eq!(fs::read(&path)?, original);
+        Ok(())
+    }
+
+    #[test]
+    fn summaries_report_payload_size_and_fallback_title() -> Result<()> {
+        let temp = tempdir()?;
+        let path = temp.path().join("card.ps2");
+        create_test_card(&path, false);
+        let files = vec![
+            sample_file("SAVE.DAT", vec![1; 1500]),
+            sample_file("EMPTY", vec![]),
+        ];
+        MemoryCard::open(&path, true)?.add_directory(
+            "BASLUS-TEST",
+            0x8420,
+            [0; 8],
+            [0; 8],
+            &files,
+        )?;
+
+        let mut card = MemoryCard::open(&path, false)?;
+        let summaries = card.save_summaries()?;
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].directory, "BASLUS-TEST");
+        assert_eq!(summaries[0].game_title, "BASLUS-TEST");
+        assert_eq!(summaries[0].file_count, 2);
+        assert_eq!(summaries[0].size_bytes, 1500);
+        Ok(())
+    }
+
+    #[test]
+    fn summaries_use_icon_sys_title() -> Result<()> {
+        let temp = tempdir()?;
+        let path = temp.path().join("card.ps2");
+        create_test_card(&path, false);
+        let icon = sample_icon_sys(b"Test Game", b"Save 1", 16);
+        let files = vec![
+            sample_file("icon.sys", icon),
+            sample_file("DATA.BIN", vec![7; 10]),
+        ];
+        MemoryCard::open(&path, true)?.add_directory(
+            "BASLUS-TEST",
+            0x8420,
+            [0; 8],
+            [0; 8],
+            &files,
+        )?;
+
+        let mut card = MemoryCard::open(&path, false)?;
+        let summaries = card.save_summaries()?;
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].game_title, "Test Game Save 1");
+        assert_eq!(summaries[0].file_count, 2);
+        assert_eq!(summaries[0].size_bytes, 964 + 10);
+        Ok(())
+    }
+
+    #[test]
+    fn summaries_ignore_invalid_icon_sys() -> Result<()> {
+        let temp = tempdir()?;
+        let path = temp.path().join("card.ps2");
+        create_test_card(&path, false);
+        let files = vec![sample_file("icon.sys", vec![0u8; 100])];
+        MemoryCard::open(&path, true)?.add_directory(
+            "BASLUS-TEST",
+            0x8420,
+            [0; 8],
+            [0; 8],
+            &files,
+        )?;
+
+        let mut card = MemoryCard::open(&path, false)?;
+        let summaries = card.save_summaries()?;
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].game_title, "BASLUS-TEST");
+        assert_eq!(summaries[0].size_bytes, 100);
+        Ok(())
+    }
+
+    #[test]
+    fn available_bytes_shrink_after_import() -> Result<()> {
+        let temp = tempdir()?;
+        let path = temp.path().join("card.ps2");
+        create_test_card(&path, false);
+        let mut card = MemoryCard::open(&path, true)?;
+        let before = card.available_bytes()?;
+        let total = card.total_bytes()?;
+        assert!(before <= total);
+        let cluster_size = u64::from(card.superblock.cluster_size());
+        drop(card);
+
+        let files = vec![sample_file("DATA", vec![1, 2, 3])];
+        MemoryCard::open(&path, true)?.add_directory("NEW-SAVE", 0x8420, [0; 8], [0; 8], &files)?;
+
+        let mut card = MemoryCard::open(&path, false)?;
+        let after = card.available_bytes()?;
+        assert_eq!(card.total_bytes()?, total);
+        // Save directory needs a second cluster for its third entry, plus
+        // one cluster for the file payload and one for root expansion.
+        assert_eq!(before - after, 4 * cluster_size);
         Ok(())
     }
 }

@@ -1,7 +1,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use japs2me::memory_card::transaction::add_directory_atomically;
-use japs2me::{ImportFile, MemoryCard, SaveImport};
+use japs2me::{format_save_table, ImportFile, MemoryCard, SaveImport};
 use std::path::Path;
 
 #[derive(Parser)]
@@ -22,9 +22,10 @@ fn main() -> Result<()> {
     match Cli::parse().command {
         Command::List { card } => {
             let mut card = MemoryCard::open(card, false)?;
-            for entry in card.entries()? {
-                println!("{} {} entries", entry.name, entry.length);
-            }
+            let summaries = card.save_summaries()?;
+            let free_bytes = card.available_bytes()?;
+            let total_bytes = card.total_bytes()?;
+            println!("{}", format_save_table(&summaries, free_bytes, total_bytes));
         }
         Command::Delete { card, name } => {
             let mut card = MemoryCard::open(card, true)?;
