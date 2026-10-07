@@ -44,6 +44,19 @@ target/release/japs2me export Mcd001.ps2 BESLES-51912PES3OPT pes3.cbs
 
 `list` displays saves as a Unicode table with the save directory, game title from `icon.sys` (falling back to the directory name), regular-file count, and total payload size. A footer shows free allocatable space. Game titles are decoded from the Shift-JIS `icon.sys` title field; missing or invalid metadata falls back to the directory name. Listed save sizes are summed file payload bytes, not on-card allocated cluster sizes. Free space is unallocated FAT clusters multiplied by the cluster size. `add` detects CodeBreaker and MAX Drive saves by their file signatures, uses the directory name stored in the save, and reports an error if that save already exists on the card. `export` writes the save directory's files, modes, and timestamps to a CodeBreaker `.cbs` file, using the `icon.sys` title when available, and refuses to overwrite an existing output file.
 
+## Scope compared with mymcplusplus
+
+JAPS2ME focuses on importing, exporting, and basic save management rather than general filesystem access:
+
+- `list` shows root save directories with titles, file counts, and payload sizes; it does not browse arbitrary directories. Free and total space appear in the `list` footer instead of a separate `df` command.
+- `add` combines mymcplusplus's `add` and `import` into one step that installs a complete `.cbs` or `.max` save.
+- `export` writes a save as CodeBreaker `.cbs` only.
+- `delete` removes a named root save directory; arbitrary file or directory management is not supported.
+- There is no GUI, file extraction, filesystem check, card formatting, mode-flag editing, or ECC override option. Standard images with or without ECC spare areas are handled automatically, and ECC is regenerated on writes.
+
+For details on the `.cbs` and `.max` containers and the PS2 memory-card filesystem,
+see the [technical format guide](docs/FORMATS.md).
+
 ## Tests
 
 Run the test suite and lint checks with:
